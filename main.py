@@ -1,8 +1,11 @@
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, getcontext
 import secrets
 import pickle
+import pytz
 from database import DataBase
+
+# getcontext().prec = 2
 
 
 def generate_account_number():
@@ -30,25 +33,63 @@ class TransactionDeclinedError(Exception):
     """
 
 
+class AccountLimitExceededError(Exception):
+    """
+    Raised when a customer tries to open more accounts than the allowed limit, which is 3.
+    """
+
+
 class ConfirmationNumber:
-    def __init__(self, transaction_type, account_number, transaction_time, transaction_id):
+    def __init__(self, transaction_type, account_number, transaction_time, transaction_id, amount='0.00'):
         self._transaction_type = transaction_type
         self._account_number = account_number
         self._transaction_time = transaction_time
         self._transaction_id = transaction_id
+        self._amount = amount
+        self._time_zone = None
+
+    @property
+    def account_number(self):
+        return self._account_number
+
+    @property
+    def transaction_type(self):
+        return self._transaction_type
 
     @property
     def transaction_id(self):
         return self._transaction_id
 
+    @property
+    def transaction_time_utc(self):
+        return self._transaction_time.isoformat()
+
+    @property
+    def transaction_time(self):
+        return self._transaction_time
+
+    @property
+    def transaction_time_local(self):
+        if self._time_zone is None:
+            raise AttributeError('This method exists to help other methods in other classes, can not work on its own')
+        return self._transaction_time.astimezone(self._time_zone).strftime('%Y-%m-%d %H:%M:%S (%Z%z)')
+
+    @property
+    def amount(self):
+        return self._amount
+
+    @amount.setter
+    def amount(self, value):
+        self._amount = str(value)
+
     def __str__(self):
         formatted_time = self._transaction_time.strftime("%Y%m%d%H%M%S")
-        transaction_id_plus_one = str(self._transaction_id + 1)
-        return f"{self._transaction_type}-{self._account_number}-{formatted_time}-{transaction_id_plus_one}"
+        return f"{self._transaction_type}-{self._account_number}-{formatted_time}-" \
+               f"{str(self._transaction_id)}-({self.amount})"
 
     def __repr__(self):
         return f"ConfirmationNumber({self._transaction_type}, {self._account_number}, {self._transaction_time}," \
-               f" {self._transaction_id})"
+               f" {self._transaction_id}, {self.amount})"
 
 
 class Account:
@@ -57,7 +98,7 @@ class Account:
 
     def __init__(self, account_number, balance, db: DataBase, time_zone):
         self._account_number = account_number
-        self._time_zone = timezone(timedelta(hours=time_zone))
+        self._time_zone = pytz.timezone(time_zone)
         self._db = db
         if not self.is_amount_a_number(balance):
             raise ValueError("Invalid balance: balance must be a number or a string representing a number")
@@ -94,7 +135,7 @@ class Account:
     def deposit(self, amount):
         confirmation_number = ConfirmationNumber(transaction_type=self._deposit_type,
                                                  account_number=self._account_number,
-                                                 transaction_time=datetime.now(timezone.utc),
+                                                 transaction_time=datetime.now(tz=pytz.utc),
                                                  transaction_id=self._db.load_transaction_id())
         self._db.save_transaction_id(confirmation_number.transaction_id + 1)
 
@@ -105,24 +146,30 @@ class Account:
         amount = Decimal(amount).quantize(Decimal('.01'))
 
         if amount < 0:
-            amount = 0
+            amount = Decimal('0.00')
+
+        confirmation_number.amount = amount
 
         self._balance += amount
         print(f"Deposited {amount}. New balance is {self._balance}")
         self._transactions.append(confirmation_number)
+        self._db.add_transaction(confirmation_number)
         return confirmation_number
 
     def apply_interest(self):
         confirmation_number = ConfirmationNumber(transaction_type=self._interest_deposit_type,
                                                  account_number=self._account_number,
-                                                 transaction_time=datetime.now(timezone.utc),
+                                                 transaction_time=datetime.now(tz=pytz.utc),
                                                  transaction_id=self._db.load_transaction_id())
         self._db.save_transaction_id(confirmation_number.transaction_id + 1)
 
-        interest = self._balance * self._db.load_monthly_interest_rate()
+        interest = (self._balance * self._db.load_monthly_interest_rate()).quantize(Decimal('.01'))
         self._balance += interest
+
+        confirmation_number.amount = interest
         print(f"Applied {self.monthly_interest_rate * 100}% interest. New balance is {self._balance}")
         self._transactions.append(confirmation_number)
+        self._db.add_transaction(confirmation_number)
         return confirmation_number
 
     @classmethod
@@ -132,7 +179,7 @@ class Account:
     def withdraw(self, amount):
         confirmation_number = ConfirmationNumber(transaction_type=self._withdrawal_type,
                                                  account_number=self._account_number,
-                                                 transaction_time=datetime.now(timezone.utc),
+                                                 transaction_time=datetime.now(tz=pytz.utc),
                                                  transaction_id=self._db.load_transaction_id())
         self._db.save_transaction_id(confirmation_number.transaction_id + 1)
 
@@ -141,6 +188,8 @@ class Account:
             raise TransactionDeclinedError("Invalid amount: amount must be a number or a string representing a number.")
 
         amount = Decimal(amount).quantize(Decimal('.01'))
+
+        confirmation_number.amount = amount
 
         if amount <= 0:
             self._transaction_failure(confirmation_number)
@@ -154,6 +203,7 @@ class Account:
         self._balance -= amount
         print(f"Withdrew {amount}. New balance is {self._balance}")
         self._transactions.append(confirmation_number)
+        self._db.add_transaction(confirmation_number)
         return confirmation_number
 
     @staticmethod
@@ -167,29 +217,59 @@ class Account:
     def _transaction_failure(self, confirmation_number):
         confirmation_number._transaction_type = self._declined_transaction_type
         self._transactions.append(confirmation_number)
+        self._db.add_transaction(confirmation_number)
 
-    def break_down_confirmation_number(self, confirmation_number):
-        transaction_type, account_number, transaction_time, transaction_id = confirmation_number
-        local_transaction_time = transaction_time.astimezone(self._time_zone)
-        return *confirmation_number, transaction_time.astimezone(self._time_zone)
+    def localize_confirmation_number(self, confirmation_number):
+        confirmation_number._time_zone = self.time_zone
+        return confirmation_number
 
     def __repr__(self):
         return f'{type(self).__name__}({self._account_number}, {self.balance}, {self._db}, {self._time_zone})'
 
 
 class Customer:
-    def __init__(self, f_name, l_name, account):
-        self.f_name = f_name
-        self.l_name = l_name
-        self._account = account
+    def __init__(self, f_name, l_name, age, gender, mobile_number, address):
+        self._f_name = f_name
+        self._l_name = l_name
+        self._age = age
+        self._gender = gender
+        self._mobile_number = mobile_number
+        self._address = address
 
     @property
     def fullname(self):
-        return f'{self.f_name} {self.l_name}'
+        return f'{self._f_name} {self._l_name}'
+
+
+class BankEmployee:
+    def __init__(self, db):
+        self._db = db
+
+    def register_customer(self, f_name, l_name, age, gender, mobile_number, address, email, national_number):
+        # check if customer has already reached the accounts limit they can have (3 accounts per user)
+        if not self._db.can_customer_have_another_account():
+            raise AccountLimitExceededError(f"Customer with national number {national_number} has exceeded the "
+                                            f"account limit")
+        # Registering customer with a new account
 
 
 if __name__ == '__main__':
-    acc = Account('140568', 100.00, DataBase('mydb.db'), -7)
-    cn = acc.deposit(50.00)
-    print(acc.balance)
-    print(cn)
+    # acc = Account(generate_account_number(), 100.00, DataBase('mydb.db'), 'Africa/Cairo')
+    # cn = acc.deposit(50.00)
+    # print(acc.balance)
+    # print(cn)
+    # # print(cn.transaction_time_local)
+    # cn = acc.localize_confirmation_number(cn)
+    # print(cn)
+    # print(cn.transaction_time_utc)
+    # print(cn.transaction_time_local)
+    # cn2 = acc.apply_interest()
+    # print(cn2)
+    # cn3 = acc.withdraw(15)
+    # print(cn3)
+    # cn4 = acc.withdraw(500)
+    # print(cn4)
+    # 9357044265893182
+    for cn in DataBase('mydb.db').get_transactions_by_type(9357044265893182):
+        print(cn)
+    # print(cn.transaction_time, type(cn.transaction_time))

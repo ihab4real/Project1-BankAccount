@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import pytz
 from decimal import Decimal
 import sqlite3
 import pickle
@@ -29,41 +30,52 @@ class DataBase:
     def create_customers_table(self):
         with sqlite3.connect(self.db_file) as conn:
             try:
-                # Check if the customers table already exists
-                cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='customers'")
-                if cursor.fetchone() is not None:
-                    # The customers table already exists, so return without re-creating it
-                    return
-
                 # Create the customers table
-                conn.execute('''CREATE TABLE customers
-                                 (id INTEGER PRIMARY KEY AUTO_INCREMENT,
+                conn.execute('''CREATE TABLE IF NOT EXISTS customers
+                                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
                                   f_name TEXT,
                                   l_name TEXT,
                                   age INTEGER,
                                   gender TEXT,
                                   mobile_number TEXT,
                                   address TEXT,
+                                  email_address TEXT,
+                                  national_number TEXT NOT NULL,
                                   account_number TEXT NOT NULL)''')
+
+                # create an index on the national_number field to improve the speed of searching for customers using
+                # this field.
+                conn.execute("CREATE INDEX national_number_index ON customers (national_number)")
+
                 # Save the changes
                 conn.commit()
 
             except sqlite3.Error as e:
                 raise TableCreationError(f"Failed to create table: {e}")
 
-    def add_customer(self, f_name, l_name, age, gender, mobile_number, address, account_number):
+    def add_customer(self, f_name, l_name, age, gender, mobile_number, address, email, national_number, account_number):
         # Insert a new customer into the customers table
         with sqlite3.connect(self.db_file) as conn:
             try:
+                # check if the customers table doesn't exist.
+                cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='customers'")
+                table_exists = cursor.fetchone() is not None
+                if not table_exists:
+                    # Create the customers table if it doesn't exist
+                    self.create_customers_table()
+
                 conn.execute(
-                    "INSERT INTO customers (f_name, l_name, age, gender, mobile_number, address, account_number) "
-                    "VALUES (:fn, :ln, :age, :gn, :mb, :addr, an)",
+                    "INSERT INTO customers (f_name, l_name, age, gender, mobile_number, "
+                    "address, email_address, national_number, account_number) "
+                    "VALUES (:fn, :ln, :age, :gn, :mb, :addr, :em, :nn, :an)",
                     {'fn': f_name,
                      'ln': l_name,
                      'age': age,
                      'gn': gender,
                      'mb': mobile_number,
                      'addr': address,
+                     'em': email,
+                     'nn': national_number,
                      'an': account_number})
 
                 # Save the changes
@@ -72,17 +84,37 @@ class DataBase:
             except sqlite3.Error as e:
                 raise DataInsertionError(f"Failed to insert data: {e}")
 
+    def can_customer_have_another_account(self, national_number):
+        with sqlite3.connect(self.db_file) as conn:
+            try:
+                # Check if the customer exists in the database
+                cursor = conn.execute("SELECT id FROM customers WHERE national_number = ?", (national_number,))
+                customer = cursor.fetchone()
+                if customer is None:
+                    # Customer does not exist in the database, so technically they didn't exceed the limit.
+                    return True
+
+                # Get the customer's ID
+                customer_id = customer[0]
+
+                # Check how many accounts the customer has
+                cursor = conn.execute("SELECT COUNT(*) FROM accounts WHERE customer_id = ?", (customer_id,))
+                num_accounts = cursor.fetchone()[0]
+
+                # Check if the customer can have another account
+                if num_accounts < 3:
+                    return True
+                else:
+                    return False
+
+            except sqlite3.Error as e:
+                raise DataRetrievalError(f"Failed to retrieve data: {e}")
+
     def create_accounts_table(self):
         with sqlite3.connect(self.db_file) as conn:
             try:
-                # Check if the accounts table already exists
-                cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='accounts'")
-                if cursor.fetchone() is not None:
-                    # The accounts table already exists, so return without creating it
-                    return
-
                 # Create the accounts table
-                conn.execute('''CREATE TABLE accounts
+                conn.execute('''CREATE TABLE IF NOT EXISTS accounts
                                  (id INTEGER PRIMARY KEY,
                                   account_object BLOB,
                                   customer_id INTEGER NOT NULL,
@@ -96,6 +128,13 @@ class DataBase:
         # Insert a new account into the accounts table
         with sqlite3.connect(self.db_file) as conn:
             try:
+                # check if the accounts table doesn't exist.
+                cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='accounts'")
+                table_exists = cursor.fetchone() is not None
+                if not table_exists:
+                    # Create the accounts table if it doesn't exist
+                    self.create_accounts_table()
+
                 conn.execute(
                     "INSERT INTO accounts (id, account_object, customer_id) VALUES (?, ?, ?)",
                     (account.account_number, pickle.dumps(account), customer_id))
@@ -107,18 +146,13 @@ class DataBase:
     def create_transactions_table(self):
         with sqlite3.connect(self.db_file) as conn:
             try:
-                # Check if the transactions table already exists
-                cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='transactions'")
-                if cursor.fetchone() is not None:
-                    # The transactions table already exists, so return without creating it
-                    return
-
-                # Create the transactions table
-                conn.execute('''CREATE TABLE transactions
+                # Create the transactions table, if it exists do nothing.
+                conn.execute('''CREATE TABLE IF NOT EXISTS transactions
                                  (id INTEGER PRIMARY KEY,
                                   account_number TEXT NOT NULL,
                                   type TEXT,
                                   created_at TIMESTAMP,
+                                  amount DECIMAL,
                                   FOREIGN KEY (account_number) REFERENCES accounts (id) ON DELETE SET NULL)''')
                 # Save the changes
                 conn.commit()
@@ -130,13 +164,21 @@ class DataBase:
         # Insert a new transaction into the transactions table
         with sqlite3.connect(self.db_file) as conn:
             try:
+                # check if the transactions table doesn't exist.
+                cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='transactions'")
+                table_exists = cursor.fetchone() is not None
+                if not table_exists:
+                    # Create the transactions table if it doesn't exist
+                    self.create_transactions_table()
+
                 conn.execute(
-                    "INSERT INTO transactions (id, account_number, type, created_at) VALUES (:id, "
-                    ":an, :type, :time)",
+                    "INSERT INTO transactions (id, account_number, type, created_at, amount) VALUES (:id, "
+                    ":an, :type, :time, :amt)",
                     {'id': confirmation_number.transaction_id,
                      'an': str(confirmation_number.account_number),
                      'type': confirmation_number.transaction_type,
-                     'time': confirmation_number.transaction_time})
+                     'time': confirmation_number.transaction_time,
+                     'amt': confirmation_number.amount})
                 # Save the changes
                 conn.commit()
 
@@ -151,11 +193,12 @@ class DataBase:
             return None
 
         # Otherwise, reconstruct the ConfirmationNumber object and return it
-        transaction_id, account_number, transaction_type, transaction_time = row
-        confirmation_number = ConfirmationNumber(transaction_type, account_number, transaction_time, transaction_id)
+        transaction_id, account_number, transaction_type, transaction_time, amount = row
+        confirmation_number = ConfirmationNumber(transaction_type, account_number,
+                                                 datetime.fromisoformat(transaction_time), transaction_id, amount)
         return confirmation_number
 
-    def get_transactions_by_type(self, account_number, transaction_type, time_range=7):
+    def get_transactions_by_type(self, account_number, transaction_type='All', time_range=7):
         with sqlite3.connect(self.db_file) as conn:
             # Check the time range argument
             if time_range == 7:
@@ -168,7 +211,7 @@ class DataBase:
                 raise ValueError('Invalid time range')
 
             # Calculate the time window
-            end_date = datetime.now(timezone.utc)
+            end_date = datetime.now(tz=pytz.utc)
             start_date = end_date - timedelta(days=days)
 
             # Build the SQL query based on the transaction_type parameter
@@ -191,7 +234,7 @@ class DataBase:
 
             try:
                 # Execute the SQL query
-                cursor = conn.execute(query, (account_number, start_date, end_date))
+                cursor = conn.execute(query, (str(account_number), start_date, end_date))
             except sqlite3.Error as e:
                 raise DataRetrievalError(f"Failed to retrieve data: {e}")
 
