@@ -4,6 +4,8 @@ import secrets
 import pickle
 import pytz
 from database import DataBase
+import re
+
 
 # getcontext().prec = 2
 
@@ -40,7 +42,7 @@ class AccountLimitExceededError(Exception):
 
 
 class ConfirmationNumber:
-    def __init__(self, transaction_type, account_number, transaction_time, transaction_id, amount='0.00'):
+    def __init__(self, transaction_type, account_number, transaction_time, transaction_id, amount=Decimal('0.00')):
         self._transaction_type = transaction_type
         self._account_number = account_number
         self._transaction_time = transaction_time
@@ -80,7 +82,7 @@ class ConfirmationNumber:
 
     @amount.setter
     def amount(self, value):
-        self._amount = str(value)
+        self._amount = Decimal(value).quantize(Decimal('.01'))
 
     def __str__(self):
         formatted_time = self._transaction_time.strftime("%Y%m%d%H%M%S")
@@ -96,7 +98,7 @@ class Account:
     monthly_interest_rate = Decimal('0.05')
     transaction_id = None
 
-    def __init__(self, account_number, balance, db: DataBase, time_zone):
+    def __init__(self, account_number, balance, db: DataBase, time_zone='Africa/Cairo'):
         self._account_number = account_number
         self._time_zone = pytz.timezone(time_zone)
         self._db = db
@@ -173,8 +175,22 @@ class Account:
         return confirmation_number
 
     @classmethod
-    def update_monthly_interest_rate(cls):
-        ...
+    def change_monthly_interest_rate(cls, interest, db):
+        if not cls.is_amount_a_number(interest):
+            raise ValueError("Invalid interest: interest must be a number or a string representing a number")
+
+        interest = Decimal(interest).quantize(Decimal('.01'))
+
+        if interest < 0:
+            raise ValueError("Invalid interest: interest must be a non-negative number")
+
+        if interest > Decimal('0.4'):
+            raise ValueError("Invalid interest: interest must not exceed 40%")
+
+        db.save_monthly_interest_rate(interest)
+
+        cls.monthly_interest_rate = interest
+        print(f"Monthly interest rate updated to {cls.monthly_interest_rate}")
 
     def withdraw(self, amount):
         confirmation_number = ConfirmationNumber(transaction_type=self._withdrawal_type,
@@ -189,8 +205,6 @@ class Account:
 
         amount = Decimal(amount).quantize(Decimal('.01'))
 
-        confirmation_number.amount = amount
-
         if amount <= 0:
             self._transaction_failure(confirmation_number)
             raise TransactionDeclinedError('Invalid amount: amount must be a positive number.')
@@ -199,6 +213,8 @@ class Account:
             self._transaction_failure(confirmation_number)
             raise TransactionDeclinedError(
                 'Invalid amount: cannot withdraw an amount of money higher than the balance.')
+
+        confirmation_number.amount = amount
 
         self._balance -= amount
         print(f"Withdrew {amount}. New balance is {self._balance}")
@@ -211,7 +227,7 @@ class Account:
         try:
             Decimal(amount).quantize(Decimal('.01'))
             return True
-        except InvalidOperation:
+        except (InvalidOperation, TypeError, ValueError):
             return False
 
     def _transaction_failure(self, confirmation_number):
@@ -228,48 +244,122 @@ class Account:
 
 
 class Customer:
-    def __init__(self, f_name, l_name, age, gender, mobile_number, address):
+    def __init__(self, f_name, l_name, age, gender, mobile_number, address, email, national_number):
         self._f_name = f_name
         self._l_name = l_name
         self._age = age
         self._gender = gender
         self._mobile_number = mobile_number
         self._address = address
+        self._email = email
+        self._national_number = national_number
 
     @property
     def fullname(self):
         return f'{self._f_name} {self._l_name}'
 
+    def __repr__(self):
+        return f"Customer('{self._f_name}', '{self._l_name}', {self._age}, '{self._gender}', '{self._mobile_number}'," \
+               f" '{self._address}', '{self._email}', '{self._national_number}')"
+
+    def __str__(self):
+        return f'''Customer Information:
+-------------------
+Full Name: {self._f_name} {self._l_name}
+Age: {self._age}
+Gender: {self._gender}
+Mobile Number: {self._mobile_number}
+Address: {self._address}
+Email: {self._email}
+National Number: {self._national_number}'''
+
 
 class BankEmployee:
-    def __init__(self, db):
+    def __init__(self, db: DataBase):
         self._db = db
 
     def register_customer(self, f_name, l_name, age, gender, mobile_number, address, email, national_number):
-        # check if customer has already reached the accounts limit they can have (3 accounts per user)
-        if not self._db.can_customer_have_another_account():
-            raise AccountLimitExceededError(f"Customer with national number {national_number} has exceeded the "
-                                            f"account limit")
+        # Validate input
+        self.validate_input(f_name, l_name, age, gender, mobile_number, address, email, national_number)
+
+        # Make the number 11-digit number
+        if isinstance(mobile_number, int):
+            mobile_number = '0' + str(mobile_number)
+
         # Registering customer with a new account
+        self._db.add_customer(f_name, l_name, age, gender, mobile_number, address, email, national_number)
+
+    @staticmethod
+    def validate_input(f_name, l_name, age, gender, mobile_number, address, email, national_number,
+                       is_new_account=False):
+        if not isinstance(f_name, str) or not f_name:
+            raise ValueError("First name must be a non-empty string")
+        if not isinstance(l_name, str) or not l_name:
+            raise ValueError("Last name must be a non-empty string")
+        national_number = str(national_number)
+        if not national_number.isdigit() or len(national_number) != 14:
+            raise ValueError("National number must be a 14-digit string")
+
+        if not is_new_account:
+            if isinstance(age, str):
+                if not age.isdigit():
+                    raise ValueError("Age must be an integer or convertible to an integer")
+                age = int(age)
+            if not isinstance(age, int) or age < 18:
+                raise ValueError("Age must be an integer greater than or equal to 18")
+            if gender not in ["Male", "Female", "Other"]:
+                raise ValueError("Gender must be one of 'Male', 'Female', 'Other'")
+            if isinstance(mobile_number, int):
+                if len(str(mobile_number)) != 10 or str(mobile_number)[0] == '0':
+                    raise ValueError(
+                        "Mobile number as an integer must have 10 digits and the leftmost digit must not be zero")
+            elif isinstance(mobile_number, str):
+                if not mobile_number.isdigit() or len(mobile_number) != 11 or mobile_number[0] != '0' \
+                        or mobile_number[1] == '0':
+                    raise ValueError(
+                        "Mobile number as a string must have 11 digits and start with a zero followed by"
+                        " a non-zero digit")
+            else:
+                raise ValueError("Mobile number must be either an integer or a string")
+            if not isinstance(address, str) or not address:
+                raise ValueError("Address must be a non-empty string")
+            if not isinstance(email, str) or not email:
+                raise ValueError("Email must be a non-empty string")
+            email_regex = re.compile(r"[^@]+@[^@]+\.[^@]+")
+            if not email_regex.match(email):
+                raise ValueError("Email must be a valid email address")
+
+    def register_new_account(self, f_name, l_name, national_number):
+        # validate arguments values
+        self.validate_input(f_name, l_name, None, None, None, None, None, national_number, is_new_account=True)
+
+        # Check if customer is already in the system
+        flag, customer = self._db.is_customer_in_the_system(national_number)
+
+        # If the customer already exists, go ahead and create the account
+        if flag:
+            # Check if customer has already reached the accounts limit they can have (3 accounts per user)
+            if not self._db.can_customer_have_another_account(national_number):
+                raise AccountLimitExceededError(f"Customer with national number {national_number} has exceeded the "
+                                                f"account limit")
+
+        else:
+            print(f"Hi {f_name}!. Welcome to our registration form! To continue, "
+                  "we need you to provide some more information about yourself.")
+            age = input("Age: ")
+            gender = input("Gender: ")
+            mobile_number = input("Mobile Number: ")
+            address = input("Address: ")
+            email = input("Email: ")
+            self.register_customer(f_name, l_name, age, gender, mobile_number, address, email, national_number)
+
+        # Create the account
+        customer_id = customer[0]
+        starting_balance = input('Enter a starting balance >= 1000.00 EGP: ')
+        preferred_timezone = input('Enter your preferred time zone: ')
+        new_account = Account(generate_account_number(), starting_balance, self._db, preferred_timezone)
+        self._db.add_account(new_account, customer_id)
 
 
 if __name__ == '__main__':
-    # acc = Account(generate_account_number(), 100.00, DataBase('mydb.db'), 'Africa/Cairo')
-    # cn = acc.deposit(50.00)
-    # print(acc.balance)
-    # print(cn)
-    # # print(cn.transaction_time_local)
-    # cn = acc.localize_confirmation_number(cn)
-    # print(cn)
-    # print(cn.transaction_time_utc)
-    # print(cn.transaction_time_local)
-    # cn2 = acc.apply_interest()
-    # print(cn2)
-    # cn3 = acc.withdraw(15)
-    # print(cn3)
-    # cn4 = acc.withdraw(500)
-    # print(cn4)
-    # 9357044265893182
-    for cn in DataBase('mydb.db').get_transactions_by_type(9357044265893182):
-        print(cn)
-    # print(cn.transaction_time, type(cn.transaction_time))
+    ...

@@ -23,6 +23,10 @@ class DataRetrievalError(Exception):
     """
 
 
+class CustomerNotFound(Exception):
+    pass
+
+
 class DataBase:
     def __init__(self, db_file):
         self.db_file = db_file
@@ -40,8 +44,7 @@ class DataBase:
                                   mobile_number TEXT,
                                   address TEXT,
                                   email_address TEXT,
-                                  national_number TEXT NOT NULL,
-                                  account_number TEXT NOT NULL)''')
+                                  national_number TEXT NOT NULL)''')
 
                 # create an index on the national_number field to improve the speed of searching for customers using
                 # this field.
@@ -53,10 +56,14 @@ class DataBase:
             except sqlite3.Error as e:
                 raise TableCreationError(f"Failed to create table: {e}")
 
-    def add_customer(self, f_name, l_name, age, gender, mobile_number, address, email, national_number, account_number):
+    def add_customer(self, f_name, l_name, age, gender, mobile_number, address, email, national_number):
         # Insert a new customer into the customers table
         with sqlite3.connect(self.db_file) as conn:
             try:
+                # Check if the customer already exists in the database
+                if self.is_customer_in_the_system(conn):
+                    return
+
                 # check if the customers table doesn't exist.
                 cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='customers'")
                 table_exists = cursor.fetchone() is not None
@@ -66,8 +73,8 @@ class DataBase:
 
                 conn.execute(
                     "INSERT INTO customers (f_name, l_name, age, gender, mobile_number, "
-                    "address, email_address, national_number, account_number) "
-                    "VALUES (:fn, :ln, :age, :gn, :mb, :addr, :em, :nn, :an)",
+                    "address, email_address, national_number) "
+                    "VALUES (:fn, :ln, :age, :gn, :mb, :addr, :em, :nn)",
                     {'fn': f_name,
                      'ln': l_name,
                      'age': age,
@@ -75,27 +82,44 @@ class DataBase:
                      'mb': mobile_number,
                      'addr': address,
                      'em': email,
-                     'nn': national_number,
-                     'an': account_number})
+                     'nn': national_number})
 
                 # Save the changes
                 conn.commit()
+                print(f"Customer {f_name} {l_name} has been successfully added to the system.")
 
             except sqlite3.Error as e:
                 raise DataInsertionError(f"Failed to insert data: {e}")
 
+    def get_customer_by_national_number(self, national_number):
+        with sqlite3.connect(self.db_file) as conn:
+            try:
+                cursor = conn.execute("SELECT * FROM customers WHERE national_number=:nn", {'nn': national_number})
+                customer = cursor.fetchone()
+
+                if customer is None:
+                    raise CustomerNotFound("Customer not found in the system.")
+
+                return {
+                    'id': customer[0],
+                    'first_name': customer[1],
+                    'last_name': customer[2],
+                    'age': customer[3],
+                    'gender': customer[4],
+                    'mobile_number': customer[5],
+                    'address': customer[6],
+                    'email_address': customer[7],
+                    'national_number': customer[8]
+                }
+
+            except sqlite3.Error as e:
+                raise DataRetrievalError(f"Failed to retrieve data: {e}")
+
     def can_customer_have_another_account(self, national_number):
         with sqlite3.connect(self.db_file) as conn:
             try:
-                # Check if the customer exists in the database
-                cursor = conn.execute("SELECT id FROM customers WHERE national_number = ?", (national_number,))
-                customer = cursor.fetchone()
-                if customer is None:
-                    # Customer does not exist in the database, so technically they didn't exceed the limit.
-                    return True
-
                 # Get the customer's ID
-                customer_id = customer[0]
+                customer_id = self.get_customer_id(conn, national_number)
 
                 # Check how many accounts the customer has
                 cursor = conn.execute("SELECT COUNT(*) FROM accounts WHERE customer_id = ?", (customer_id,))
@@ -110,6 +134,28 @@ class DataBase:
             except sqlite3.Error as e:
                 raise DataRetrievalError(f"Failed to retrieve data: {e}")
 
+    def is_customer_in_the_system(self, national_number):
+        with sqlite3.connect(self.db_file) as conn:
+            try:
+                cursor = conn.execute("SELECT id FROM customers WHERE national_number = ?", (national_number,))
+                customer = cursor.fetchone()
+                if customer is None:
+                    # Customer does not exist in the database.
+                    return False, customer
+                return True, customer
+
+            except sqlite3.Error as e:
+                raise DataRetrievalError(f"Failed to retrieve data: {e}")
+
+    @staticmethod
+    def get_customer_id(conn, national_number):
+        try:
+            cursor = conn.execute("SELECT id FROM customers WHERE national_number = ?", (national_number,))
+            customer = cursor.fetchone()
+            return customer[0]
+        except sqlite3.Error as e:
+            raise DataRetrievalError(f"Failed to retrieve data: {e}")
+
     def create_accounts_table(self):
         with sqlite3.connect(self.db_file) as conn:
             try:
@@ -121,6 +167,7 @@ class DataBase:
                                   FOREIGN KEY (customer_id) REFERENCES customers (id) ON DELETE CASCADE)''')
                 # Save the changes
                 conn.commit()
+
             except sqlite3.Error as e:
                 raise TableCreationError(f"Failed to create table: {e}")
 
@@ -138,8 +185,11 @@ class DataBase:
                 conn.execute(
                     "INSERT INTO accounts (id, account_object, customer_id) VALUES (?, ?, ?)",
                     (account.account_number, pickle.dumps(account), customer_id))
+
                 # Save the changes
                 conn.commit()
+                print(f"Account with account number {account.account_number} has been successfully added.")
+
             except sqlite3.Error as e:
                 raise DataInsertionError(f"Failed to insert data: {e}")
 
@@ -152,7 +202,7 @@ class DataBase:
                                   account_number TEXT NOT NULL,
                                   type TEXT,
                                   created_at TIMESTAMP,
-                                  amount DECIMAL,
+                                  amount INTEGER,
                                   FOREIGN KEY (account_number) REFERENCES accounts (id) ON DELETE SET NULL)''')
                 # Save the changes
                 conn.commit()
@@ -178,7 +228,7 @@ class DataBase:
                      'an': str(confirmation_number.account_number),
                      'type': confirmation_number.transaction_type,
                      'time': confirmation_number.transaction_time,
-                     'amt': confirmation_number.amount})
+                     'amt': int(confirmation_number.amount*100)})
                 # Save the changes
                 conn.commit()
 
@@ -257,7 +307,7 @@ class DataBase:
                 else:
                     # if the transaction_id hasn't been saved to the database yet, the value of transaction_id will
                     # start from 0 and increase after each transaction.
-                    self.save_transaction_id(1)
+                    self.save_transaction_id(0)
                     return 0
 
             except sqlite3.Error as e:
@@ -277,7 +327,8 @@ class DataBase:
                     conn.execute("UPDATE metadata SET value = ? WHERE key = 'transaction_id'", (str(transaction_id),))
                 else:
                     # Insert the initial value of the transaction_id into the database
-                    conn.execute("INSERT INTO metadata (key, value) VALUES ('transaction_id', ?)", (str(transaction_id),))
+                    conn.execute("INSERT INTO metadata (key, value) VALUES ('transaction_id', ?)",
+                                 (str(transaction_id),))
                 # Save the changes
                 conn.commit()
 
